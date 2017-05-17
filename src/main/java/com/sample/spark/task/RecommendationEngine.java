@@ -82,6 +82,7 @@ public class RecommendationEngine {
                 long diff = getTimeDiff(logEntry1.getTime(), logEntry2.getTime());
                 result.setTime(diff);
                 return result;
+
             }
         });
 
