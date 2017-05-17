@@ -7,8 +7,6 @@ import org.apache.spark.api.java.JavaSparkContext;
 import org.apache.spark.api.java.function.Function;
 import org.apache.spark.api.java.function.Function2;
 import org.apache.spark.api.java.function.PairFunction;
-import org.apache.spark.api.java.function.VoidFunction;
-import org.apache.spark.broadcast.Broadcast;
 import org.apache.spark.mllib.recommendation.ALS;
 import org.apache.spark.mllib.recommendation.MatrixFactorizationModel;
 import org.apache.spark.mllib.recommendation.Rating;
@@ -124,22 +122,31 @@ public class RecommendationEngineV2 {
 
         printAfterMappingUserWithViewingTime(userLogEntryJavaPairRDD);
 
-        JavaPairRDD<String, LogEntry> userMaxTimeLogEntryJavaPairRDD = userLogEntryJavaPairRDD.reduceByKey((logEntry1, logEntry2) -> {
+        JavaPairRDD<String, Long> userMaxTimeLogEntryJavaPairRDD = userLogEntryJavaPairRDD.reduceByKey((logEntry1, logEntry2) -> {
                     if (Math.max(logEntry1.getTime(), logEntry2.getTime()) == logEntry1.getTime()) {
                         return logEntry1;
                     } else return logEntry2;
                 }
-        );
+        ).mapToPair(t -> new Tuple2<String, Long>(t._1(), t._2().getTime()));
 
         printAfterCalculatingLongestViewingTime(userMaxTimeLogEntryJavaPairRDD);
 
-        Map<String, LogEntry> userLogEntryMap = userMaxTimeLogEntryJavaPairRDD.collectAsMap();
+        // To avoid collecting max time for each user
+        JavaPairRDD<String, LogEntry> userIdToRecencyTotalTimeJoinRDDPair = recencyTotalTimeJoinRDDPair.mapToPair(t -> {
+            return new Tuple2<String, LogEntry>(t._1().substring(0, t._1().indexOf("_")), t._2());
+        });
 
-        JavaRDD<LogEntry> finalLogEntries = recencyTotalTimeJoinRDDPair.map(new Function<Tuple2<String, LogEntry>, LogEntry>() {
+        JavaPairRDD<String, Tuple2<LogEntry, Long>> join = userIdToRecencyTotalTimeJoinRDDPair.join(userMaxTimeLogEntryJavaPairRDD);
+
+        JavaPairRDD<String, LogEntry> userContentToFinalLogEntriesRDD = join.mapToPair(t -> {
+            LogEntry entry = SerializationUtils.clone(t._2()._1());
+            entry.setFrequency(t._2()._1().getTime() / t._2()._2());
+            return new Tuple2<String, LogEntry>(t._2()._1().getUserId() + "_" + t._2()._1().getContentId(), entry);
+        });
+
+        JavaRDD<LogEntry> finalLogEntries = userContentToFinalLogEntriesRDD.map(new Function<Tuple2<String, LogEntry>, LogEntry>() {
             @Override
             public LogEntry call(Tuple2<String, LogEntry> stringLogEntryTuple) throws Exception {
-                LogEntry frequencyTuple = userLogEntryMap.get(stringLogEntryTuple._1().substring(0, stringLogEntryTuple._1().indexOf("_")));
-                stringLogEntryTuple._2().setFrequency(stringLogEntryTuple._2().getTime() / frequencyTuple.getTime());
                 stringLogEntryTuple._2().setRating(Math.ceil(RATING_FUNCTION.call(stringLogEntryTuple._2().getRecency(), stringLogEntryTuple._2().getFrequency())));
                 return stringLogEntryTuple._2();
             }
@@ -214,10 +221,10 @@ public class RecommendationEngineV2 {
         }
     }
 
-    private static void printAfterCalculatingLongestViewingTime(JavaPairRDD<String, LogEntry> userMaxTimeLogEntryJavaPairRDD) {
+    private static void printAfterCalculatingLongestViewingTime(JavaPairRDD<String, Long> userMaxTimeLogEntryJavaPairRDD) {
         if (ENABLE_DEBUG_MODE) {
             System.out.println("PRINTING AFTER CALCULATING LONGEST VIEWING TIME....");
-            userMaxTimeLogEntryJavaPairRDD.foreach(item -> System.out.println(item._1() + ":" + item._2().getTime()));
+            userMaxTimeLogEntryJavaPairRDD.foreach(item -> System.out.println(item._1() + ":" + item._2()));
         }
     }
 
