@@ -101,6 +101,8 @@ public class RecommendationEngineV2 {
             }
         });
 
+        // JavaPairRDD<String, Long> userContentTotalTimeJavaPairRDD = totalTimeLogEntryPairRDD.mapToPair(t -> new Tuple2<>(t._1(), t._2().getTime()));
+
         // Join Recency And Total Time RDD into single Pair.
         JavaPairRDD<String, Tuple2<Double, LogEntry>> recencyTotalTimeJoinRDD = userContentRecencyRDD
                 .join(totalTimeLogEntryPairRDD);
