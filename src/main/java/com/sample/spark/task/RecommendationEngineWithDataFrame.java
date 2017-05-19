@@ -38,15 +38,14 @@ public class RecommendationEngineWithDataFrame {
 
         RecommendationEngine.generateLogEntries();
 
-        SparkSession sparkSession = SparkSession
-                .builder()
-                .appName("RecommendationEngineWithDataFrame")
-                .config("spark.master", "local")
-                .getOrCreate();
+        // Create Spark Session
+        SparkSession sparkSession = getSparkSession();
 
-        JavaSparkContext sc = new JavaSparkContext(sparkSession.sparkContext());
-        Logger.getLogger("org").setLevel(Level.OFF);
-        Logger.getLogger("akka").setLevel(Level.OFF);
+        // Create Java Spark context
+        JavaSparkContext sc = getJavaSparkContext(sparkSession);
+
+        // Set log
+        setLoggerLevel();
 
         // playMethod2(sparkSession);
 
@@ -145,6 +144,23 @@ public class RecommendationEngineWithDataFrame {
         System.out.println("Calling Recommend method");
         JavaPairRDD<Integer, String> itemDescription = RecommendationEngine.fetchItemDescRDD(sparkSession, RecommendationEngine.contentInfoPath);
         users.forEach(u -> RecommendationEngine.recommend(sparkSession, sc, RecommendationEngine.contentInfoPath, model, userProducts, u, itemDescription));
+    }
+
+    private static void setLoggerLevel() {
+        Logger.getLogger("org").setLevel(Level.OFF);
+        Logger.getLogger("akka").setLevel(Level.OFF);
+    }
+
+    private static JavaSparkContext getJavaSparkContext(SparkSession sparkSession) {
+        return new JavaSparkContext(sparkSession.sparkContext());
+    }
+
+    private static SparkSession getSparkSession() {
+        return SparkSession
+                .builder()
+                .appName("RecommendationEngineWithDataFrame")
+                .config("spark.master", "local")
+                .getOrCreate();
     }
 
     private static void printUserContentRatingDF(Dataset<Row> userContentRatingDF) {

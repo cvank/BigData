@@ -39,75 +39,73 @@ public class RecommendationEngineWithDataFrameV2 {
 
         RecommendationEngine.generateLogEntries();
 
-        SparkSession sparkSession = SparkSession
-                .builder()
-                .appName("RecommendationEngineWithDataFrame")
-                .config("spark.master", "local")
-                .getOrCreate();
+        SparkSession sparkSession = getSparkSession();
 
-        JavaSparkContext sc = new JavaSparkContext(sparkSession.sparkContext());
-        Logger.getLogger("org").setLevel(Level.OFF);
-        Logger.getLogger("akka").setLevel(Level.OFF);
+        JavaSparkContext sc = getJavaSparkContext(sparkSession);
+
+        setLoggerLevel();
 
         // Create RDD
-        JavaRDD<String> logEntriesRDD = sparkSession.read().textFile(RecommendationEngine.path).javaRDD();
+        JavaRDD<String> logEntriesRDD = readLogFile(sparkSession);
 
         // Convert RDD to Rows
-        JavaRDD<Row> logEntriesRowRDD = logEntriesRDD.map(r -> {
-            String[] attributes = r.split(",");
-            return RowFactory.create(attributes);
-        });
+        JavaRDD<Row> logEntriesRowRDD = convertRDDToRows(logEntriesRDD);
 
         // Schema
-        String schemaString = "sessionId userId contentId timestamp";
+        String schemaString = getSchemaString();
 
-        List<StructField> structFields = new ArrayList<>();
-        Arrays.stream(schemaString.split(" ")).forEach(field -> structFields.add(DataTypes.createStructField(field, DataTypes.StringType, true)));
-
-        StructType schema = DataTypes.createStructType(structFields);
+        StructType schema = createSchema(schemaString);
 
         //Apply the schema to the row RDD.
-        Dataset<Row> logEntriesDFFromRDD = sparkSession.createDataFrame(logEntriesRowRDD, schema);
+        Dataset<Row> logEntriesDFFromRDD = applySchemaToRDD(sparkSession, logEntriesRowRDD, schema);
 
         logEntriesDFFromRDD.createOrReplaceTempView("log");
 
         // Viewing time for each content based on session ID
-        Dataset<Row> viewingTimeDF = sparkSession.sql("SELECT log1.sessionId, log1.userId, log1.contentId" +
-                ", (log2.timestamp-log1.timestamp) as timediff FROM log log1 INNER JOIN log log2 on log1.sessionId=log2.sessionId where (log2.timestamp-log1.timestamp) > 0").toDF();
+        Dataset<Row> viewingTimeDF = getViewingTimeDF(sparkSession);
 
-        printViewingTimeDF(viewingTimeDF);
-
-        Dataset<Row> userContentTotalTimeDF = viewingTimeDF
-                .groupBy("userId", "contentId")
-                .sum("timediff").orderBy("userId").toDF("userId", "contentId", "timediff");
-
-        printUserContentAndTimeDiffDF(userContentTotalTimeDF);
+        // Calculate Total viewing time for user and content combination.
+        Dataset<Row> userContentTotalTimeDF = getTotalTimeByUserandContent(viewingTimeDF);
 
         // Calculate Recency.
         Dataset<Row> recencyDF = calculateRecency(sparkSession);
-        recencyDF.createOrReplaceTempView("recencyDFView");
 
-        Dataset<Row> longestViewingTimeDF = viewingTimeDF.groupBy("userId").max("timediff").toDF("userId", "longest_view_time");
+        // Calculate Longest viewing time for each user
+        Dataset<Row> longestViewingTimeDF = getLongestViewingTimeForEachUserAsDF(viewingTimeDF);
 
-        sparkSession.udf().register("FREQUENCY", new UDF2<Double, Double, Double>() {
+        // Create UDF to calculate Frequency
+        registerFrequencyUDF(sparkSession);
+
+        // Join on User content total time and Longest viewing time per user.
+        Dataset<Row> userContentTotalTimeAndLongestTimeJoinDF = joinUserContentTotalTimeAndLongestViewingTime(userContentTotalTimeDF, longestViewingTimeDF);
+
+        // Calculate Frequency by using FREQUENCY UDF.
+        Dataset<Row> frequencyDF = calculateFrequency(userContentTotalTimeAndLongestTimeJoinDF);
+
+
+        // Register Rating UDF
+        registerRatingUDF(sparkSession);
+
+        // create ratings for each user and content making use of recency and frequency.
+        Dataset<Row> ratingDF = getRatingDF(recencyDF, frequencyDF);
+
+        // Convert Rating DF to Java RDD
+        JavaRDD<Rating> ratingsJavaRDD = convertRatingDFtoJavaRDD(ratingDF);
+
+        // Perform ALS and print recommendations.
+        triggerALS(sparkSession, sc, ratingsJavaRDD);
+    }
+
+    private static void registerRatingUDF(SparkSession sparkSession) {
+        sparkSession.udf().register("RATING", new UDF2<Double, Double, Double>() {
             @Override
             public Double call(Double aDouble, Double aDouble2) throws Exception {
-                return aDouble / aDouble2;
+                return aDouble + aDouble2;
             }
         }, DataTypes.DoubleType);
+    }
 
-        Dataset<Row> userContentTotalTimeAndLongestTimeJoinDF = userContentTotalTimeDF.join(longestViewingTimeDF, "userId");
-        Dataset<Row> frequencyDF1 = userContentTotalTimeAndLongestTimeJoinDF.select("userId", "contentId", "timediff", "longest_view_time")
-                .withColumn("frequency", callUDF("FREQUENCY", col("timediff"), col("longest_view_time")));
-
-        Dataset<Row> ratingDF = frequencyDF1.join(recencyDF).select("userId", "contentId", "frequency", "recency")
-                .withColumn("rating", callUDF("RATING", col("frequency"), col("recency")));
-
-        JavaRDD<Row> userContentRatingRDD = ratingDF.toJavaRDD();
-        JavaRDD<Rating> ratingsJavaRDD = userContentRatingRDD.map(row -> {
-            return new Rating(Integer.parseInt(row.getAs("userId")), Integer.parseInt(row.getAs("contentId")), row.getAs("rating"));
-        });
-
+    private static void triggerALS(SparkSession sparkSession, JavaSparkContext sc, JavaRDD<Rating> ratingsJavaRDD) {
         int rank = 10; // 10 latent factors
         int numIterations = 10; // number of iterations
 
@@ -120,6 +118,102 @@ public class RecommendationEngineWithDataFrameV2 {
         System.out.println("Calling Recommend method");
         JavaPairRDD<Integer, String> itemDescription = RecommendationEngine.fetchItemDescRDD(sparkSession, RecommendationEngine.contentInfoPath);
         users.forEach(u -> RecommendationEngine.recommend(sparkSession, sc, RecommendationEngine.contentInfoPath, model, userProducts, u, itemDescription));
+    }
+
+    private static JavaRDD<Rating> convertRatingDFtoJavaRDD(Dataset<Row> ratingDF) {
+        JavaRDD<Row> userContentRatingRDD = ratingDF.toJavaRDD();
+        return userContentRatingRDD.map(row -> {
+            return new Rating(Integer.parseInt(row.getAs("userId")), Integer.parseInt(row.getAs("contentId")), row.getAs("rating"));
+        });
+    }
+
+    private static Dataset<Row> getRatingDF(Dataset<Row> recencyDF, Dataset<Row> frequencyDF) {
+        return frequencyDF.join(recencyDF, frequencyDF.col("userId").equalTo(recencyDF.col("userId")).and(frequencyDF.col("contentId").equalTo(recencyDF.col("contentId"))))
+                .select(frequencyDF.col("userId"), frequencyDF.col("contentId"), col("frequency"), col("recency"))
+                .withColumn("rating", callUDF("RATING", col("frequency"), col("recency")))
+                .select("userId", "contentId", "rating").toDF("userId", "contentId", "rating");
+    }
+
+    private static Dataset<Row> calculateFrequency(Dataset<Row> userContentTotalTimeAndLongestTimeJoinDF) {
+        return userContentTotalTimeAndLongestTimeJoinDF.select("userId", "contentId", "timediff", "longest_view_time")
+                .withColumn("frequency", callUDF("FREQUENCY", col("timediff"), col("longest_view_time")));
+    }
+
+    private static Dataset<Row> joinUserContentTotalTimeAndLongestViewingTime(Dataset<Row> userContentTotalTimeDF, Dataset<Row> longestViewingTimeDF) {
+        return userContentTotalTimeDF.join(longestViewingTimeDF, "userId");
+    }
+
+    private static void registerFrequencyUDF(SparkSession sparkSession) {
+        sparkSession.udf().register("FREQUENCY", new UDF2<Double, Double, Double>() {
+            @Override
+            public Double call(Double aDouble, Double aDouble2) throws Exception {
+                return C2 * (aDouble / aDouble2);
+            }
+        }, DataTypes.DoubleType);
+    }
+
+    private static Dataset<Row> getLongestViewingTimeForEachUserAsDF(Dataset<Row> viewingTimeDF) {
+        return viewingTimeDF.groupBy("userId").max("timediff").toDF("userId", "longest_view_time");
+    }
+
+    private static Dataset<Row> getTotalTimeByUserandContent(Dataset<Row> viewingTimeDF) {
+        Dataset<Row> userContentTotalTimeDF = viewingTimeDF
+                .groupBy("userId", "contentId")
+                .sum("timediff").orderBy("userId").toDF("userId", "contentId", "timediff");
+
+        printUserContentAndTimeDiffDF(userContentTotalTimeDF);
+        return userContentTotalTimeDF;
+    }
+
+    private static Dataset<Row> getViewingTimeDF(SparkSession sparkSession) {
+        Dataset<Row> viewingTimeDF = sparkSession.sql("SELECT log1.sessionId, log1.userId, log1.contentId" +
+                ", (log2.timestamp-log1.timestamp) as timediff FROM log log1 INNER JOIN log log2 on log1.sessionId=log2.sessionId where (log2.timestamp-log1.timestamp) > 0").toDF();
+
+        printViewingTimeDF(viewingTimeDF);
+        return viewingTimeDF;
+    }
+
+    private static Dataset<Row> applySchemaToRDD(SparkSession sparkSession, JavaRDD<Row> logEntriesRowRDD, StructType schema) {
+        return sparkSession.createDataFrame(logEntriesRowRDD, schema);
+    }
+
+    private static StructType createSchema(String schemaString) {
+        List<StructField> structFields = new ArrayList<>();
+        Arrays.stream(schemaString.split(" ")).forEach(field -> structFields.add(DataTypes.createStructField(field, DataTypes.StringType, true)));
+
+        return DataTypes.createStructType(structFields);
+    }
+
+    private static String getSchemaString() {
+        return "sessionId userId contentId timestamp";
+    }
+
+    private static JavaRDD<Row> convertRDDToRows(JavaRDD<String> logEntriesRDD) {
+        return logEntriesRDD.map(r -> {
+            String[] attributes = r.split(",");
+            return RowFactory.create(attributes);
+        });
+    }
+
+    private static JavaRDD<String> readLogFile(SparkSession sparkSession) {
+        return sparkSession.read().textFile(RecommendationEngine.path).javaRDD();
+    }
+
+    private static void setLoggerLevel() {
+        Logger.getLogger("org").setLevel(Level.OFF);
+        Logger.getLogger("akka").setLevel(Level.OFF);
+    }
+
+    private static JavaSparkContext getJavaSparkContext(SparkSession sparkSession) {
+        return new JavaSparkContext(sparkSession.sparkContext());
+    }
+
+    private static SparkSession getSparkSession() {
+        return SparkSession
+                .builder()
+                .appName("RecommendationEngineWithDataFrame")
+                .config("spark.master", "local")
+                .getOrCreate();
     }
 
     private static Dataset<Row> calculateRecency(SparkSession sparkSession) {
